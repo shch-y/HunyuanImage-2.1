@@ -18,7 +18,7 @@ from hyimage.common.format_prompt import MultilingualPromptFormat
 from hyimage.models.text_encoder import PROMPT_TEMPLATE
 from hyimage.models.model_zoo import HUNYUANIMAGE_REPROMPT, HUNYUANIMAGE_REPROMPT_32B
 from hyimage.models.text_encoder.byT5 import load_glyph_byT5_v2
-from hyimage.models.hunyuan.modules.hunyuanimage_dit import load_hunyuan_dit_state_dict
+from hyimage.models.hunyuan.modules.hunyuanimage_dit import load_hunyuan_dit_state_dict,HYImageDiffusionTransformer
 from hyimage.diffusion.cfg_utils import AdaptiveProjectedGuidance, rescale_noise_cfg
 
 
@@ -61,7 +61,42 @@ class HunyuanImagePipelineConfig:
     torch_dtype: str = "bf16"
     device: str = "cpu"
     version: str = ""
-
+    
+    def disable_all_offloading(self):
+        self.enable_stage1_offloading = False
+        self.enable_refiner_offloading = False
+        self.enable_text_encoder_offloading = False
+        self.enable_full_dit_offloading = False
+        self.enable_vae_offloading = False
+    
+    def enable_stage_offloading(self):
+        self.enable_stage1_offloading = True
+        
+    def enable_reinfer_offloading(self):
+        self.enable_refiner_offloading = True
+  
+    @classmethod
+    def create_bench(cls,use_fp8: bool = True):
+        from hyimage.models.model_zoo import (
+            HUNYUANIMAGE_V2_1_DIT,
+            HUNYUANIMAGE_V2_1_VAE_32x,
+            HUNYUANIMAGE_V2_1_TEXT_ENCODER,
+        )
+        cfg = cls(
+            dit_config=HUNYUANIMAGE_V2_1_DIT(),
+            vae_config=HUNYUANIMAGE_V2_1_VAE_32x(),
+            text_encoder_config=HUNYUANIMAGE_V2_1_TEXT_ENCODER(),
+            reprompt_config=HUNYUANIMAGE_REPROMPT(),
+            shift=5,
+            default_guidance_scale=3.5,
+            default_sampling_steps=50,
+            version="v2.1",
+        )
+        cfg.use_fp8 = use_fp8
+        cfg.disable_all_offloading()
+        return cfg
+    
+    
     @classmethod
     def create_default(cls, version: str = "v2.1", use_distilled: bool = False, reprompt_model="hunyuanimage-reprompt-32b", **kwargs):
         """
@@ -166,14 +201,20 @@ class HunyuanImagePipeline:
             
         try:
             dit_config = self.config.dit_config
-            self.dit = instantiate(dit_config.model, dtype=self.torch_dtype, device=dit_device)
+            loguru.logger.info("- instantinating DiT model...")
+            from eval.apps.utils.trace_utils import timeit,time_block
+
+
+            with torch.device("meta"):
+                self.dit = instantiate(dit_config.model)
             if self.config.use_fp8:
                 from hyimage.models.utils.fp8_quantization import convert_fp8_linear
                 if not Path(dit_config.fp8_scale).exists():
                     raise FileNotFoundError(f"FP8 scale file not found: {dit_config.fp8_scale}. Please download from https://huggingface.co/tencent/HunyuanImage-2.1/")
                 if dit_config.fp8_load_from is not None and Path(dit_config.fp8_load_from).exists():
                     convert_fp8_linear(self.dit, dit_config.fp8_scale)
-                    load_hunyuan_dit_state_dict(self.dit, dit_config.fp8_load_from, strict=True)
+                    loguru.logger.info("- loading_fp8_hunyuan...")
+                    load_hunyuan_dit_state_dict(self.dit, dit_config.fp8_load_from, strict=True,assign=True)
                 else:
                     raise FileNotFoundError(f"FP8 ckpt not found: {dit_config.fp8_load_from}. Please download from https://huggingface.co/tencent/HunyuanImage-2.1/")
                     load_hunyuan_dit_state_dict(self.dit, dit_config.load_from, strict=True)
@@ -184,9 +225,12 @@ class HunyuanImagePipeline:
                 self.dit = self.dit.to(dit_device, dtype=self.torch_dtype)
             self.dit.eval()
             if getattr(dit_config, "use_compile", False):
+                loguru.logger.info("- Compiling DiT model...")
                 self.dit = torch.compile(self.dit)
             loguru.logger.info("✓ DiT model loaded")
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             raise RuntimeError(f"Error loading DiT model: {e}") from e
 
     def _load_text_encoder(self):
@@ -854,6 +898,7 @@ class HunyuanImagePipeline:
         self.device = device
         if not self.config.enable_full_dit_offloading and not self.config.enable_stage1_offloading:
             if self.dit is not None:
+                self.dit : HYImageDiffusionTransformer
                 self.dit = self.dit.to(device, non_blocking=True)
         if not self.config.enable_text_encoder_offloading:
             if self.text_encoder is not None:
@@ -861,6 +906,10 @@ class HunyuanImagePipeline:
         if self.vae is not None:
             self.vae = self.vae.to(device, non_blocking=True)
         return self
+    def offload_sync(self,device):
+        self.dit = self.dit.to("cpu",non_blocking=False)
+        self.text_encoder = self.text_encoder.to("cpu",non_blocking=False)
+        self.vae = self.vae.to("cpu",non_blocking=False)
     
     def offload(self):
         if self.dit is not None:
