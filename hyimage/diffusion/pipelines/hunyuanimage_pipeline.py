@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Optional
 from einops import rearrange
 from pathlib import Path
+from typing import Union
 
 from tqdm import tqdm
 import loguru
@@ -143,7 +144,7 @@ class HunyuanImagePipeline:
 
     def __init__(
         self,
-        config: HunyuanImagePipelineConfig,
+        config: Union[HunyuanImagePipelineConfig],
         **kwargs
     ):
         """
@@ -905,6 +906,12 @@ class HunyuanImagePipeline:
                 self.text_encoder = self.text_encoder.to(device, non_blocking=True)
         if self.vae is not None:
             self.vae = self.vae.to(device, non_blocking=True)
+        return self
+    def to_sync(self,device):
+        self.device = device
+        self.dit = self.dit.to(device, non_blocking=False)
+        self.text_encoder = self.text_encoder.to(device, non_blocking=False)
+        self.vae = self.vae.to(device, non_blocking=False)
         return self
     def offload_sync(self,device):
         self.dit = self.dit.to("cpu",non_blocking=False)
